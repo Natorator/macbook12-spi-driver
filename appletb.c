@@ -643,9 +643,8 @@ static int appletb_tb_event(struct hid_device *hdev, struct hid_field *field,
 	/* only switch touchbar mode when no touchbar keys are pressed */
 	appletb_update_touchbar_no_lock(tb_data, false);
 
-	/*
-	 * We want to suppress touchbar keys while the touchbar is off, but we
-	 * do want to wake up the screen if it's asleep, so generate a dummy
+	/* we want suppress touchbar keys while touchbar is off, but we do
+	 * want to wake up the screen if it's asleep, so generate a dummy
 	 * event.
 	 */
 	if (tb_data->cur_tb_mode == APPLETB_CMD_MODE_OFF ||
@@ -808,7 +807,6 @@ static int appletb_input_configured(struct hid_device *hdev,
 		input_set_capability(input, EV_KEY, appletb_fn_codes[idx].to);
 	}
 	input_set_capability(input, EV_KEY, KEY_ESC);
-	input_set_capability(input, EV_KEY, KEY_UNKNOWN);
 
 	return 0;
 }

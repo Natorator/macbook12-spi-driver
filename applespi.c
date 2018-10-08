@@ -7,10 +7,10 @@
  */
 
 /**
- * The keyboard and touchpad controller on the MacBook8,1 and newer, and on
- * MacBookPro12,1 and newer, can be driven either by USB or SPI. However the
- * USB pins are only connected on the MacBookPro12,1, all others need this
- * driver. The interface is selected using ACPI methods:
+ * The keyboard and touchpad controller on the MacBook8,1, MacBook9,1 and
+ * MacBookPro12,1 can be driven either by USB or SPI. However the USB pins
+ * are only connected on the MacBookPro12,1, all others need this driver.
+ * The interface is selected using ACPI methods:
  *
  * * UIEN ("USB Interface Enable"): If invoked with argument 1, disables SPI
  *   and enables USB. If invoked with argument 0, disables USB.
@@ -78,6 +78,7 @@
 #define PACKET_TYPE_WRITE	0x40
 #define PACKET_DEV_KEYB		0x01
 #define PACKET_DEV_TPAD		0x02
+#define PACKET_DEV_INFO		0xd0
 
 #define MAX_ROLLOVER		6
 #define MAX_MODIFIERS		8
@@ -222,6 +223,17 @@ struct touchpad_protocol {
 };
 
 /**
+ * struct command_protocol_info - get keyboard/touchpad info.
+ * message.type = 0x1020, message.length = 0x0000
+ *
+ * @crc_16:		crc over the whole message struct (message header +
+ *			this struct) minus this @crc_16 field
+ */
+struct command_protocol_info {
+	__le16			crc_16;
+};
+
+/**
  * struct command_protocol_mt_init - initialize multitouch.
  * message.type = 0x0252, message.length = 0x0002
  *
@@ -297,12 +309,13 @@ struct message {
 	union {
 		struct keyboard_protocol	keyboard;
 		struct touchpad_protocol	touchpad;
+		struct command_protocol_info	info_command;
 		struct command_protocol_mt_init	init_mt_command;
 		struct command_protocol_capsl	capsl_command;
 		struct command_protocol_bl	bl_command;
 		__u8				data[0];
 	};
-};
+} __packed __aligned(2);
 
 /* type + zero + counter + rsp_buf_len + length */
 #define MSG_HEADER_SIZE	8
@@ -340,7 +353,7 @@ struct spi_packet {
 	__le16			length;
 	__u8			data[246];
 	__le16			crc_16;
-};
+} __packed __aligned(2);
 
 struct spi_settings {
 #ifdef PRE_SPI_PROPERTIES
@@ -396,6 +409,7 @@ struct applespi_data {
 	struct spi_transfer		st_t;
 	struct spi_message		wr_m;
 
+	bool				want_info_cmd;
 	bool				want_mt_init_cmd;
 	bool				want_cl_led_on;
 	bool				have_cl_led_on;
@@ -898,6 +912,20 @@ static int applespi_send_cmd_msg(struct applespi_data *applespi)
 	memset(packet, 0, APPLESPI_PACKET_SIZE);
 
 	/* are we processing init commands? */
+	if (applespi->want_info_cmd) {
+		applespi->want_info_cmd = false;
+		applespi->want_mt_init_cmd = true;
+		applespi->cmd_log_mask = DBG_CMD_TP_INI;
+
+		/* build init command */
+		device = PACKET_DEV_INFO;
+
+		message->type = cpu_to_le16(0x1020);
+		msg_len = sizeof(message->info_command);
+
+		message->zero = 0x02;
+		message->rsp_buf_len = cpu_to_le16(0x0200);
+
 	} else if (applespi->want_mt_init_cmd) {
 		applespi->want_mt_init_cmd = false;
 		applespi->cmd_log_mask = DBG_CMD_TP_INI;
@@ -957,7 +985,8 @@ static int applespi_send_cmd_msg(struct applespi_data *applespi)
 	message->counter = applespi->cmd_msg_cntr++ & 0xff;
 
 	message->length = cpu_to_le16(msg_len - 2);
-	message->rsp_buf_len = message->length;
+	if (!message->rsp_buf_len)
+		message->rsp_buf_len = message->length;
 
 	crc = crc16(0, (u8 *)message, le16_to_cpu(packet->length) - 2);
 	*((__le16 *)&message->data[msg_len - 2]) = cpu_to_le16(crc);
@@ -985,7 +1014,7 @@ static void applespi_init(struct applespi_data *applespi)
 
 	spin_lock_irqsave(&applespi->cmd_msg_lock, flags);
 
-	applespi->want_mt_init_cmd = true;
+	applespi->want_info_cmd = true;
 	applespi_send_cmd_msg(applespi);
 
 	spin_unlock_irqrestore(&applespi->cmd_msg_lock, flags);
@@ -1009,6 +1038,7 @@ static int applespi_set_capsl_led(struct applespi_data *applespi,
 
 static void applespi_set_bl_level(struct led_classdev *led_cdev,
 				  enum led_brightness value)
+
 {
 	struct applespi_data *applespi =
 		container_of(led_cdev, struct applespi_data, backlight_info);
@@ -1289,7 +1319,14 @@ static void applespi_handle_cmd_response(struct applespi_data *applespi,
 					 struct spi_packet *packet,
 					 struct message *message)
 {
-	if (le16_to_cpu(message->length) != 0x0000) {
+	if (packet->device == PACKET_DEV_INFO &&
+	    le16_to_cpu(message->type) == 0x1020)
+		print_hex_dump(KERN_DEBUG, pr_fmt("info "), DUMP_PREFIX_NONE,
+			       32, 1, applespi->rx_buffer, APPLESPI_PACKET_SIZE,
+			       false);
+
+	if (le16_to_cpu(message->length) != 0x0000 &&
+	    le16_to_cpu(message->type) != 0x1020) {
 		dev_warn_ratelimited(&applespi->spi->dev,
 				     "Received unexpected write response: length=%x\n",
 				     le16_to_cpu(message->length));
@@ -1829,6 +1866,7 @@ static void applespi_shutdown(struct spi_device *spi)
 	applespi_save_bl_level(applespi->have_bl_level);
 }
 
+#ifdef CONFIG_PM
 static int applespi_poweroff_late(struct device *dev)
 {
 	struct spi_device *spi = to_spi_device(dev);
@@ -1905,6 +1943,7 @@ static int applespi_resume(struct device *dev)
 
 	return 0;
 }
+#endif
 
 static const struct acpi_device_id applespi_acpi_match[] = {
 	{ "APP000D", 0 },
